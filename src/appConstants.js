@@ -1,7 +1,8 @@
 'use strict';
+
 import keymirror from 'keymirror';
 
-export default {
+const AppConstants = {
   ActionTypes: keymirror({
     TRAFFIC_DATA_RECEIVED: null,
     SERVER_ACTION: null,
@@ -12,3 +13,5 @@ export default {
     CLEAR_FILTERS: null
   })
 };
+
+export default AppConstants;

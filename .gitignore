@@ -1,6 +1,9 @@
 # System
 .DS_Store
 
+# IDE config
+/.idea
+
 # Generated
 /.jshintignore
 /.jshintrc
@@ -10,3 +13,8 @@ node_modules
 
 # Typings
 *.ts
+
+# Temporary Files and Backups
+*.swp
+*.*~
+package-lock.json

@@ -1,16 +1,22 @@
 'use strict';
+
 import _ from 'lodash';
+import { Alert } from 'react-bootstrap';
 import React from 'react';
 import TWEEN from 'tween.js'; // Start TWEEN updates for sparklines and loading screen fading out
-import keypress from 'keypress.js';
-import request from 'superagent';
 import Vizceral from 'vizceral-react';
 import 'vizceral-react/dist/vizceral.css';
+import keypress from 'keypress.js';
+import queryString from 'query-string';
+import request from 'superagent';
 
+import './trafficFlow.css';
 import Breadcrumbs from './breadcrumbs';
 import DisplayOptions from './displayOptions';
+import PhysicsOptions from './physicsOptions';
 import FilterControls from './filterControls';
-import NodeDetails from './nodeDetails';
+import DetailsPanelConnection from './detailsPanelConnection';
+import DetailsPanelNode from './detailsPanelNode';
 import LoadingCover from './loadingCover';
 import Locator from './locator';
 import OptionsPanel from './optionsPanel';
@@ -21,6 +27,8 @@ import filterStore from './filterStore';
 
 const listener = new keypress.Listener();
 
+const hasOwnPropFunc = Object.prototype.hasOwnProperty;
+
 function animate (time) {
   requestAnimationFrame(animate);
   TWEEN.update(time);
@@ -29,35 +37,48 @@ requestAnimationFrame(animate);
 
 const panelWidth = 400;
 
-
 class TrafficFlow extends React.Component {
   constructor (props) {
     super(props);
+
     this.state = {
-      currentView: [],
+      currentView: undefined,
+      redirectedFrom: undefined,
       selectedChart: undefined,
       displayOptions: {
+        allowDraggingOfNodes: false,
         showLabels: true
+      },
+      currentGraph_physicsOptions: {
+        isEnabled: true,
+        viscousDragCoefficient: 0.2,
+        hooksSprings: {
+          restLength: 50,
+          springConstant: 0.2,
+          dampingConstant: 0.1
+        },
+        particles: {
+          mass: 1
+        }
       },
       labelDimensions: {},
       appliedFilters: filterStore.getChangedFilters(),
       filters: filterStore.getFiltersArray(),
-      graphs: { regions: {} },
-      renderedGraphs: {},
       searchTerm: '',
       matches: {
         total: -1,
         visible: -1
       },
-      trafficData: {},
+      trafficData: {
+        nodes: [],
+        connections: []
+      },
       regionUpdateStatus: [],
       timeOffset: 0,
       modes: {
         detailedNode: 'volume'
       }
     };
-    this.traffic = { nodes: [], connections: [] };
-    this.nodeDetailsPanelOffset = 0;
 
     // Browser history support
     window.addEventListener('popstate', event => this.handlePopState(event.state));
@@ -74,32 +95,61 @@ class TrafficFlow extends React.Component {
 
   handlePopState () {
     const state = window.history.state || {};
-    this.setState({ currentView: state.selected });
+    this.poppedState = true;
+    this.setState({ currentView: state.selected, objectToHighlight: state.highlighted });
   }
 
-  viewChanged = data => {
-    this.setState({ currentView: data.view, currentGraph: data.graph, nodeFocused: undefined, nodeHighlighted: undefined, searchTerm: '', matches: { total: -1, visible: -1 } });
+  viewChanged = (data) => {
+    const changedState = {
+      currentView: data.view,
+      searchTerm: '',
+      matches: { total: -1, visible: -1 },
+      redirectedFrom: data.redirectedFrom
+    };
+    if (hasOwnPropFunc.call(data, 'graph')) {
+      let oldCurrentGraph = this.state.currentGraph;
+      if (oldCurrentGraph == null) oldCurrentGraph = null;
+      let newCurrentGraph = data.graph;
+      if (newCurrentGraph == null) newCurrentGraph = null;
+      if (oldCurrentGraph !== newCurrentGraph) {
+        changedState.currentGraph = newCurrentGraph;
+        const o = newCurrentGraph === null ? null : newCurrentGraph.getPhysicsOptions();
+        changedState.currentGraph_physicsOptions = o;
+      }
+    }
+    this.setState(changedState);
   }
 
-  nodeHighlighted = node => {
-    this.setState({ highlightedNode: node, searchTerm: '', matches: { total: -1, visible: -1 } });
+  viewUpdated = () => {
+    this.setState({});
   }
 
-  rendered = data => {
-    const renderedGraphs = _.clone(this.state.renderedGraphs);
-    renderedGraphs[data.name] = data.rendered;
-    this.setState({ renderedGraphs: renderedGraphs });
+  objectHighlighted = (highlightedObject) => {
+    // need to set objectToHighlight for diffing on the react component. since it was already highlighted here, it will be a noop
+    this.setState({ highlightedObject: highlightedObject, objectToHighlight: highlightedObject ? highlightedObject.getName() : undefined, searchTerm: '', matches: { total: -1, visible: -1 }, redirectedFrom: undefined });
   }
 
-  nodeFocused = node => {
-    this.setState({ focusedNode: node });
-  }
-
-  nodeContextSizeChanged = dimensions => {
+  nodeContextSizeChanged = (dimensions) => {
     this.setState({ labelDimensions: dimensions });
   }
 
+  checkInitialRoute () {
+    // Check the location bar for any direct routing information
+    const pathArray = window.location.pathname.split('/');
+    const currentView = [];
+    if (pathArray[1]) {
+      currentView.push(pathArray[1]);
+      if (pathArray[2]) {
+        currentView.push(pathArray[2]);
+      }
+    }
+    const parsedQuery = queryString.parse(window.location.search);
+
+    this.setState({ currentView: currentView, objectToHighlight: parsedQuery.highlighted });
+  }
+
   beginSampleData () {
+    this.traffic = { nodes: [], connections: [] };
     request.get('sample_data.json')
       .set('Accept', 'application/json')
       .end((err, res) => {
@@ -110,21 +160,8 @@ class TrafficFlow extends React.Component {
       });
   }
 
-  checkRoute () {
-    const pathArray = window.location.pathname.split('/');
-    const currentView = [];
-    if (pathArray[1]) {
-      currentView.push(pathArray[1]);
-      if (pathArray[2]) {
-        currentView.push(pathArray[2]);
-      }
-    }
-    this.setState({ currentView: currentView });
-  }
-
   componentDidMount () {
-    // Check the location bar for any direct routing information
-    this.checkRoute();
+    this.checkInitialRoute();
     this.beginSampleData();
 
     // Listen for changes to the stores
@@ -136,17 +173,23 @@ class TrafficFlow extends React.Component {
   }
 
   shouldComponentUpdate (nextProps, nextState) {
-    if (!this.state.currentView || this.state.currentView[0] !== nextState.currentView[0] ||
-        this.state.currentView[1] !== nextState.currentView[1]) {
+    if (!this.state.currentView ||
+        this.state.currentView[0] !== nextState.currentView[0] ||
+        this.state.currentView[1] !== nextState.currentView[1] ||
+        this.state.highlightedObject !== nextState.highlightedObject) {
       const titleArray = (nextState.currentView || []).slice(0);
       titleArray.unshift('Vizceral');
       document.title = titleArray.join(' / ');
 
-      if (nextState.currentView) {
+      if (this.poppedState) {
+        this.poppedState = false;
+      } else if (nextState.currentView) {
+        const highlightedObjectName = nextState.highlightedObject && nextState.highlightedObject.getName();
         const state = {
           title: document.title,
-          url: nextState.currentView.join('/'),
-          selected: nextState.currentView
+          url: nextState.currentView.join('/') + (highlightedObjectName ? `?highlighted=${highlightedObjectName}` : ''),
+          selected: nextState.currentView,
+          highlighted: highlightedObjectName
         };
         window.history.pushState(state, state.title, state.url);
       }
@@ -155,49 +198,17 @@ class TrafficFlow extends React.Component {
   }
 
   updateData (newTraffic) {
-    this.traffic.name = newTraffic.name;
-    this.traffic.renderer = newTraffic.renderer;
-
-    let modified = false;
-    if (newTraffic) {
-      modified = true;
-      // Update the traffic graphs with the new state
-      _.each(newTraffic.nodes, node => {
-        const existingNodeIndex = _.findIndex(this.traffic.nodes, { name: node.name });
-        if (existingNodeIndex !== -1) {
-          node.updated = node.updated || this.traffic.nodes[existingNodeIndex].updated;
-          this.traffic.nodes[existingNodeIndex] = node;
-        } else {
-          this.traffic.nodes.push(node);
-        }
-      });
-      _.each(newTraffic.connections, connection => {
-        const existingConnectionIndex = _.findIndex(this.traffic.connections, { source: connection.source, target: connection.target });
-        if (existingConnectionIndex !== -1) {
-          this.traffic.connections[existingConnectionIndex] = connection;
-        } else {
-          this.traffic.connections.push(connection);
-        }
-      });
-    }
-
-    if (modified) {
-      this.setState({
-        regionUpdateStatus: _.map(_.filter(this.traffic.nodes, n => n.name !== 'INTERNET'), node => {
-          const updated = node.updated;
-          return { region: node.name, updated: updated };
-        }),
-        timeOffset: newTraffic.clientUpdateTime - newTraffic.serverUpdateTime,
-        trafficData: _.cloneDeep(this.traffic)
-      });
-    }
-  }
-
-  isFocusedNode () {
-    return !this.isSelectedNode()
-      && this.state.currentView
-      && this.state.currentView[0] !== undefined
-      && this.state.focusedNode !== undefined;
+    const regionUpdateStatus = _.map(_.filter(newTraffic.nodes, n => n.name !== 'INTERNET'), (node) => {
+      const updated = node.updated;
+      return { region: node.name, updated: updated };
+    });
+    const lastUpdatedTime = _.max(_.map(regionUpdateStatus, 'updated'));
+    this.setState({
+      regionUpdateStatus: regionUpdateStatus,
+      timeOffset: newTraffic.clientUpdateTime - newTraffic.serverUpdateTime,
+      lastUpdatedTime: lastUpdatedTime,
+      trafficData: newTraffic
+    });
   }
 
   isSelectedNode () {
@@ -206,20 +217,29 @@ class TrafficFlow extends React.Component {
 
   zoomCallback = () => {
     const currentView = _.clone(this.state.currentView);
-    if (currentView.length === 1) {
-      currentView.push(this.state.foucsedNode.name);
+    if (currentView.length === 1 && this.state.focusedNode) {
+      currentView.push(this.state.focusedNode.name);
     } else if (currentView.length === 2) {
       currentView.pop();
     }
     this.setState({ currentView: currentView });
   }
 
-  displayOptionsChanged = options => {
+  displayOptionsChanged = (options) => {
     const displayOptions = _.merge({}, this.state.displayOptions, options);
     this.setState({ displayOptions: displayOptions });
   }
 
-  navigationCallback = newNavigationState => {
+  physicsOptionsChanged = (physicsOptions) => {
+    this.setState({ currentGraph_physicsOptions: physicsOptions });
+    let currentGraph = this.state.currentGraph;
+    if (currentGraph == null) currentGraph = null;
+    if (currentGraph !== null) {
+      currentGraph.setPhysicsOptions(physicsOptions);
+    }
+  }
+
+  navigationCallback = (newNavigationState) => {
     this.setState({ currentView: newNavigationState });
   }
 
@@ -229,7 +249,7 @@ class TrafficFlow extends React.Component {
       this.setState({ currentView: [this.state.currentView[0]] });
     } else {
       // If there is just a detailed node, remove the detailed node.
-      this.setState({ focusedNode: undefined, highlightedNode: undefined });
+      this.setState({ focusedNode: undefined, highlightedObject: undefined });
     }
   }
 
@@ -250,27 +270,42 @@ class TrafficFlow extends React.Component {
     }
   }
 
-  locatorChanged = value => {
+  locatorChanged = (value) => {
     this.setState({ searchTerm: value });
   }
 
-  chartChanged = chartName => {
-    this.setState({ selectedChart: chartName });
-  }
-
-  matchesFound = matches => {
+  matchesFound = (matches) => {
     this.setState({ matches: matches });
   }
 
-  graphsUpdated = graphs => {
-    this.setState({ graphs: graphs });
+  nodeClicked = (node) => {
+    if (this.state.currentView.length === 1) {
+      // highlight node
+      this.setState({ objectToHighlight: node.getName() });
+    } else if (this.state.currentView.length === 2) {
+      // detailed view of node
+      this.setState({ currentView: [this.state.currentView[0], node.getName()] });
+    }
+  }
+
+  resetLayoutButtonClicked = () => {
+    const g = this.state.currentGraph;
+    if (g != null) {
+      g._relayout();
+    }
+  }
+
+  dismissAlert = () => {
+    this.setState({ redirectedFrom: undefined });
   }
 
   render () {
     const globalView = this.state.currentView && this.state.currentView.length === 0;
     const nodeView = !globalView && this.state.currentView && this.state.currentView[1] !== undefined;
-    const nodeToShowDetails = this.state.focusedNode || this.state.highlightedNode;
-    const showLoadingCover = !!(this.state.currentView && this.state.currentView[0] && !this.state.renderedGraphs[this.state.currentView[0]]);
+    let nodeToShowDetails = this.state.currentGraph && this.state.currentGraph.focusedNode;
+    nodeToShowDetails = nodeToShowDetails || (this.state.highlightedObject && this.state.highlightedObject.type === 'node' ? this.state.highlightedObject : undefined);
+    const connectionToShowDetails = this.state.highlightedObject && this.state.highlightedObject.type === 'connection' ? this.state.highlightedObject : undefined;
+    const showLoadingCover = !this.state.currentGraph;
 
     let matches;
     if (this.state.currentGraph) {
@@ -284,35 +319,58 @@ class TrafficFlow extends React.Component {
 
     return (
       <div className="vizceral-container">
+        { this.state.redirectedFrom ?
+          <Alert onDismiss={this.dismissAlert}>
+            <strong>{this.state.redirectedFrom.join('/') || '/'}</strong> does not exist, you were redirected to <strong>{this.state.currentView.join('/') || '/'}</strong> instead
+          </Alert>
+        : undefined }
         <div className="subheader">
           <Breadcrumbs rootTitle="global" navigationStack={this.state.currentView || []} navigationCallback={this.navigationCallback} />
           <UpdateStatus status={this.state.regionUpdateStatus} baseOffset={this.state.timeOffset} warnThreshold={180000} />
-          <div style={{ float: 'right', paddingTop: '2px' }}>
+          <div style={{ float: 'right', paddingTop: '4px' }}>
             { (!globalView && matches) && <Locator changeCallback={this.locatorChanged} searchTerm={this.state.searchTerm} matches={matches} clearFilterCallback={this.filtersCleared} /> }
             <OptionsPanel title="Filters"><FilterControls /></OptionsPanel>
             <OptionsPanel title="Display"><DisplayOptions options={this.state.displayOptions} changedCallback={this.displayOptionsChanged} /></OptionsPanel>
+            <OptionsPanel title="Physics"><PhysicsOptions options={this.state.currentGraph_physicsOptions} changedCallback={this.physicsOptionsChanged}/></OptionsPanel>
+            <a role="button" className="reset-layout-link" onClick={this.resetLayoutButtonClicked}>Reset Layout</a>
           </div>
         </div>
         <div className="service-traffic-map">
-          <div style={{ position: 'absolute', top: '0px', right: !!nodeToShowDetails ? '380px' : '0px', bottom: '0px', left: '0px' }}>
+          <div style={{ position: 'absolute', top: '0px', right: nodeToShowDetails || connectionToShowDetails ? '380px' : '0px', bottom: '0px', left: '0px' }}>
             <Vizceral traffic={this.state.trafficData}
                       view={this.state.currentView}
                       showLabels={this.state.displayOptions.showLabels}
                       filters={this.state.filters}
-                      graphsUpdated={this.graphsUpdated}
                       viewChanged={this.viewChanged}
-                      nodeHighlighted={this.nodeHighlighted}
-                      rendered={this.rendered}
-                      nodeFocused={this.nodeFocused}
+                      viewUpdated={this.viewUpdated}
+                      objectHighlighted={this.objectHighlighted}
                       nodeContextSizeChanged={this.nodeContextSizeChanged}
+                      objectToHighlight={this.state.objectToHighlight}
                       matchesFound={this.matchesFound}
                       match={this.state.searchTerm}
                       modes={this.state.modes}
+                      allowDraggingOfNodes={this.state.displayOptions.allowDraggingOfNodes}
             />
           </div>
           {
             !!nodeToShowDetails &&
-            <NodeDetails node={nodeToShowDetails} nodeSelected={nodeView} region={this.state.currentView[0]} width={panelWidth} zoomCallback={this.zoomCallback} closeCallback={this.detailsClosed} />
+            <DetailsPanelNode node={nodeToShowDetails}
+                              nodeSelected={nodeView}
+                              region={this.state.currentView[0]}
+                              width={panelWidth}
+                              zoomCallback={this.zoomCallback}
+                              closeCallback={this.detailsClosed}
+                              nodeClicked={node => this.nodeClicked(node)}
+            />
+          }
+          {
+            !!connectionToShowDetails &&
+            <DetailsPanelConnection connection={connectionToShowDetails}
+                                    region={this.state.currentView[0]}
+                                    width={panelWidth}
+                                    closeCallback={this.detailsClosed}
+                                    nodeClicked={node => this.nodeClicked(node)}
+            />
           }
           <LoadingCover show={showLoadingCover} />
         </div>
